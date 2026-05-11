@@ -12,64 +12,88 @@ namespace BACKUPANDRESTORETOOL
     public partial class Form1 : Form
     {
         private readonly BackupRestoreController _controller;
+        private HashSet<string> _allowedDbs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+     
 
         public Form1()
         {
             InitializeComponent();
             _controller = new BackupRestoreController();
 
-            // Make label textboxes read-only
-            textBox1.ReadOnly = true; // "Database to Export"
-            textBox2.ReadOnly = true; // "Export Path"
-            textBox4.ReadOnly = true; // "Select Database File"
-            textBox6.ReadOnly = true; // "Target Schema"
+            progressBar1.Visible = false;
+            progressBar1.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
+            progressBar1.Minimum = 0;
+            progressBar1.Maximum = 100;
+            progressBar1.Value = 0;
 
-            // Path fields filled by browse dialogs
+            textBox1.ReadOnly = true;
+            textBox2.ReadOnly = true;
+            textBox4.ReadOnly = true;
+            textBox6.ReadOnly = true;
             textBox3.ReadOnly = true;
             textBox5.ReadOnly = true;
 
-            // FIX 1: Make comboBox1 read-only (selection only, no typing)
             comboBox1.DropDownStyle = ComboBoxStyle.DropDownList;
 
-            // FIX 2: Allow only one checked item at a time in checkedListBox2
             checkedListBox2.ItemCheck += checkedListBox2_ItemCheck;
+            checkedListBox1.ItemCheck += checkedListBox1_ItemCheck;
 
             this.Load += Form1_Load;
         }
 
         private void Form1_Load(object sender, EventArgs e)
         {
-            // ── Validate environment FIRST before anything else ──
             string envError = _controller.ValidateEnvironment();
             if (envError != null)
             {
                 MessageBox.Show(envError, "Setup Required",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
-
-                // Disable backup/restore buttons so user can't proceed
-                button1.Enabled = false; // Export
-                button5.Enabled = false; // Import
+                button1.Enabled = false;
+                button5.Enabled = false;
             }
 
-            // Set the default export path
             textBox3.Text = @"D:\backup";
             textBox5.Text = string.Empty;
+
             LoadDatabases();
+            LoadTargetSchemas();
         }
+
         private void LoadDatabases()
         {
             try
             {
                 checkedListBox1.Items.Clear();
-                comboBox1.Items.Clear();
-                comboBox1.Items.Add("- Select Schema -");
-                comboBox1.SelectedIndex = 0;
 
-                var databases = _controller.GetDatabases();
-                foreach (var db in databases)
+                var allDatabases = _controller.GetAllDatabases();
+
+                var allowedDbs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var varName in new[] { "dbname", "dbname2", "dbname3" })
                 {
+                    string val = Environment.GetEnvironmentVariable(varName, EnvironmentVariableTarget.Machine)
+                              ?? Environment.GetEnvironmentVariable(varName, EnvironmentVariableTarget.User)
+                              ?? Environment.GetEnvironmentVariable(varName, EnvironmentVariableTarget.Process);
+
+                    if (!string.IsNullOrWhiteSpace(val))
+                    {
+                        foreach (var db in val.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            string trimmed = db.Trim();
+                            if (!string.IsNullOrWhiteSpace(trimmed))
+                                allowedDbs.Add(trimmed);
+                        }
+                    }
+                }
+
+                _allowedDbs = allowedDbs;
+
+                foreach (var db in allDatabases)
                     checkedListBox1.Items.Add(db);
-                    comboBox1.Items.Add(db);
+
+                for (int i = 0; i < checkedListBox1.Items.Count; i++)
+                {
+                    if (!_allowedDbs.Contains(checkedListBox1.Items[i].ToString()))
+                        checkedListBox1.SetItemCheckState(i, CheckState.Unchecked);
                 }
             }
             catch (Exception ex)
@@ -80,7 +104,39 @@ namespace BACKUPANDRESTORETOOL
             }
         }
 
-        // FIX 2: Only allow one checked item at a time in checkedListBox2
+        private void checkedListBox1_ItemCheck(object sender, ItemCheckEventArgs e)
+        {
+            string itemName = checkedListBox1.Items[e.Index].ToString();
+            if (!_allowedDbs.Contains(itemName))
+                e.NewValue = CheckState.Unchecked;
+        }
+
+        private void LoadTargetSchemas()
+        {
+            try
+            {
+                string currentText = comboBox1.Text;
+
+                comboBox1.Items.Clear();
+                comboBox1.Items.Add("- Select Schema -");
+
+                var allDbs = _controller.GetAllDatabases();
+                foreach (var db in allDbs)
+                    comboBox1.Items.Add(db);
+
+                if (!string.IsNullOrWhiteSpace(currentText))
+                    comboBox1.Text = currentText;
+                else
+                    comboBox1.SelectedIndex = 0;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    "Failed to load schemas:\n\n" + ex.Message,
+                    "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
         private void checkedListBox2_ItemCheck(object sender, ItemCheckEventArgs e)
         {
             if (e.NewValue == CheckState.Checked)
@@ -95,7 +151,6 @@ namespace BACKUPANDRESTORETOOL
 
         // ── BACKUP TAB ──
 
-        // button3 — Browse export folder
         private void button3_Click(object sender, EventArgs e)
         {
             using (var dlg = new FolderBrowserDialog())
@@ -106,7 +161,6 @@ namespace BACKUPANDRESTORETOOL
             }
         }
 
-        // button1 — Export
         private async void button1_Click(object sender, EventArgs e)
         {
             if (checkedListBox1.CheckedItems.Count == 0)
@@ -135,25 +189,26 @@ namespace BACKUPANDRESTORETOOL
             var crypto = new ACryptoServiceProvider();
             string plainPassword = crypto.Decrypt(encryptedPassword, "pullasciiencrypt");
 
-            // ── Safe branch name — remove invalid filename characters ──
             string branch = Environment.GetEnvironmentVariable("branch", EnvironmentVariableTarget.Machine)
                             ?? Environment.GetEnvironmentVariable("branch")
-                            ?? "backup";  // ← safe default instead of "please config environment variable"
+                            ?? "backup";
 
-            // ── Strip any invalid filename characters from branch ──
             foreach (char c in Path.GetInvalidFileNameChars())
                 branch = branch.Replace(c.ToString(), "_");
 
             var selectedDbs = new List<string>();
             foreach (var item in checkedListBox1.CheckedItems)
-                selectedDbs.Add(item.ToString());
+            {
+                int idx = checkedListBox1.Items.IndexOf(item);
+                if (checkedListBox1.GetItemCheckState(idx) == CheckState.Checked)
+                    selectedDbs.Add(item.ToString());
+            }
 
             string fileName = string.Format("{0}_{1}.7z",
                 branch, DateTime.Now.ToString("yyyy_MM_dd"));
 
             string destPath = Path.Combine(textBox3.Text, fileName);
 
-            // ── Show exactly what will be created ──
             var confirm = MessageBox.Show(
                 string.Format("Starting backup of {0} database(s).\n\nOutput file:\n{1}\n\nContinue?",
                     selectedDbs.Count, destPath),
@@ -179,7 +234,6 @@ namespace BACKUPANDRESTORETOOL
             finally { SetUiBusy(false); }
         }
 
-        // button2 — Cancel Backup (FIX 3: close the form like X button)
         private void button2_Click(object sender, EventArgs e)
         {
             this.Close();
@@ -187,7 +241,6 @@ namespace BACKUPANDRESTORETOOL
 
         // ── RESTORE TAB ──
 
-        // button4 — Browse backup file + populate checkedListBox2 with databases inside zip
         private void button4_Click_1(object sender, EventArgs e)
         {
             using (var dlg = new OpenFileDialog())
@@ -198,7 +251,6 @@ namespace BACKUPANDRESTORETOOL
 
                 textBox5.Text = dlg.FileName;
 
-                // ★ Read databases inside the zip and show in checkedListBox2
                 try
                 {
                     var dbsInZip = _controller.GetDatabasesFromZip(dlg.FileName);
@@ -218,7 +270,6 @@ namespace BACKUPANDRESTORETOOL
             }
         }
 
-        // button5 — Import checked databases from zip into target schema
         private async void button5_Click(object sender, EventArgs e)
         {
             if (string.IsNullOrWhiteSpace(textBox5.Text))
@@ -235,7 +286,6 @@ namespace BACKUPANDRESTORETOOL
                 return;
             }
 
-            // ★ Check at least one database selected from zip
             if (checkedListBox2.CheckedItems.Count == 0)
             {
                 MessageBox.Show("Please check at least one database to restore.",
@@ -243,14 +293,21 @@ namespace BACKUPANDRESTORETOOL
                 return;
             }
 
-            if (comboBox1.SelectedIndex <= 0)
+            string targetDatabase = comboBox1.Text?.Trim();
+
+            if (string.IsNullOrWhiteSpace(targetDatabase) || targetDatabase == "- Select Schema -")
             {
-                MessageBox.Show("Please select a target schema to restore into.",
+                MessageBox.Show("Please select or type a target schema name.",
                     "No Schema Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            string targetDatabase = comboBox1.SelectedItem.ToString();
+            if (!System.Text.RegularExpressions.Regex.IsMatch(targetDatabase, @"^[a-zA-Z0-9_]+$"))
+            {
+                MessageBox.Show("Schema name can only contain letters, numbers, and underscores.",
+                    "Invalid Schema Name", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             var confirm = MessageBox.Show(
                 string.Format("WARNING: This will OVERWRITE the '{0}' database.\n\n" +
@@ -260,31 +317,71 @@ namespace BACKUPANDRESTORETOOL
             if (confirm != DialogResult.Yes) return;
 
             SetUiBusy(true);
+            progressBar1.Visible = true;
             try
             {
                 string sourceFile = textBox5.Text;
 
-                // ★ Restore each checked database from the zip into the target schema
                 foreach (var item in checkedListBox2.CheckedItems)
                 {
                     string dbToRestore = item.ToString();
+
+                    // Stage 1 - Extracting
+                    labelStatus.Text = string.Format("Extracting {0}...", dbToRestore);
+                    labelStatus.ForeColor = System.Drawing.Color.DarkOrange;
                     await Task.Run(() =>
-                        _controller.RestoreSpecific(sourceFile, targetDatabase, dbToRestore));
+                        _controller.ExtractOnly(sourceFile, dbToRestore));
+
+                    // Stage 2 - Restoring
+                    // PALITAN NG:
+                    progressBar1.Value = 0;
+                    labelStatus.Text = string.Format("Restoring {0} into {1}... ~0%", dbToRestore, targetDatabase);
+                    labelStatus.ForeColor = System.Drawing.Color.DarkBlue;
+
+                    var restoreProgress = new Progress<int>(percent =>
+                    {
+                        // Hanggang 95% lang — hindi mag-100% hanggang hindi talaga tapos
+                        int displayPercent = Math.Min(percent, 95);
+                        progressBar1.Value = displayPercent;
+                        labelStatus.Text = string.Format(
+                            "Restoring {0} into {1}... ~{2}%",
+                            dbToRestore, targetDatabase, displayPercent);
+                    });
+
+                    await Task.Run(() =>
+                        _controller.RestoreOnly(sourceFile, targetDatabase, dbToRestore, restoreProgress));
+
+                    // Tapos na talaga — set to 100
+                    progressBar1.Value = 100;
+                    labelStatus.Text = string.Format("Restoring {0} into {1}... 100%", dbToRestore, targetDatabase);
                 }
+
+                labelStatus.Text = "Restore completed successfully!";
+                labelStatus.ForeColor = System.Drawing.Color.Green;
 
                 MessageBox.Show(
                     string.Format("Import completed successfully!\n\nRestored into: {0}", targetDatabase),
                     "Import Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+                LoadDatabases();
+                LoadTargetSchemas();
+                comboBox1.Text = targetDatabase;
             }
             catch (Exception ex)
             {
+                labelStatus.Text = "Restore failed!";
+                labelStatus.ForeColor = System.Drawing.Color.Red;
                 MessageBox.Show(ex.Message, "Import Failed",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-            finally { SetUiBusy(false); }
+            finally
+            {
+                progressBar1.Visible = false;
+                labelStatus.Text = "";
+                SetUiBusy(false);
+            }
         }
 
-        // button6 — Cancel Restore (FIX 3: close the form like X button)
         private void button6_Click(object sender, EventArgs e)
         {
             this.Close();
@@ -318,22 +415,20 @@ namespace BACKUPANDRESTORETOOL
                 : "Backup and Restore Tool";
         }
 
-        private void checkedListBox2_SelectedIndexChanged(object sender, EventArgs e)
-        {
-
-        }
+        private void checkedListBox2_SelectedIndexChanged(object sender, EventArgs e) { }
 
         private void button6_Click_1(object sender, EventArgs e)
         {
             this.Close();
         }
 
-        private void tabPage2_Click(object sender, EventArgs e)
-        {
+        private void tabPage2_Click(object sender, EventArgs e) { }
 
-        }
+        private void textBox6_TextChanged(object sender, EventArgs e) { }
 
-        private void textBox6_TextChanged(object sender, EventArgs e)
+        private void progressBar1_Click(object sender, EventArgs e) { }
+
+        private void label1_Click(object sender, EventArgs e)
         {
 
         }

@@ -46,19 +46,11 @@ namespace BACKUPANDRESTORETOOL.Controller
         // ── LIVE PROGRESS LOG HELPERS ──
         // ════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Returns the path of the live progress log for a given session.
-        /// Format: D:\backup\progress_SESSIONID.log
-        /// </summary>
         private static string GetProgressLogPath(string sessionId)
         {
             return Path.Combine(BackupTempFolder, string.Format("progress_{0}.log", sessionId));
         }
 
-        /// <summary>
-        /// Appends a timestamped status line to the live progress log.
-        /// Safe to call from any thread — never throws.
-        /// </summary>
         private static void LogProgress(string progressLogPath, string message)
         {
             try
@@ -157,9 +149,24 @@ namespace BACKUPANDRESTORETOOL.Controller
                 "  6. Click OK and RESTART this application.";
         }
 
-        // ── GET ALL DATABASES ──
+        // ── GET DATABASES (filtered by env variable) — used for Backup tab ──
         public List<string> GetDatabases()
         {
+            string envDb = Environment.GetEnvironmentVariable("dbname", EnvironmentVariableTarget.Machine)
+                        ?? Environment.GetEnvironmentVariable("dbname", EnvironmentVariableTarget.User)
+                        ?? Environment.GetEnvironmentVariable("dbname", EnvironmentVariableTarget.Process);
+
+            var allowedDbs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(envDb))
+            {
+                foreach (var db in envDb.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string trimmed = db.Trim();
+                    if (!string.IsNullOrWhiteSpace(trimmed))
+                        allowedDbs.Add(trimmed);
+                }
+            }
+
             var databases = new List<string>();
 
             string connStr = string.Format(
@@ -175,11 +182,17 @@ namespace BACKUPANDRESTORETOOL.Controller
                     while (reader.Read())
                     {
                         string dbName = reader.GetString(0);
-                        if (dbName != "information_schema" &&
-                            dbName != "performance_schema" &&
-                            dbName != "mysql" &&
-                            dbName != "sys")
-                            databases.Add(dbName);
+
+                        if (dbName == "information_schema" ||
+                            dbName == "performance_schema" ||
+                            dbName == "mysql" ||
+                            dbName == "sys")
+                            continue;
+
+                        if (allowedDbs.Count > 0 && !allowedDbs.Contains(dbName))
+                            continue;
+
+                        databases.Add(dbName);
                     }
                 }
             }
@@ -198,7 +211,6 @@ namespace BACKUPANDRESTORETOOL.Controller
 
             var databases = new List<string>();
 
-            // ── Always use 7z.exe for listing (7zg.exe does not support the 'l' command) ──
             string args = string.Format("l \"{0}\" \"-p{1}\"", zipPath, plainPassword);
 
             var psi = new ProcessStartInfo
@@ -238,6 +250,40 @@ namespace BACKUPANDRESTORETOOL.Controller
             return databases;
         }
 
+        // ── GET ALL DATABASES (no env variable filter) — used for Target Schema dropdown ──
+        public List<string> GetAllDatabases()
+        {
+            var databases = new List<string>();
+
+            string connStr = string.Format(
+                "Server={0};Port={1};Uid={2};Password={3};",
+                _config.Server, _config.Port, _config.UserId, _config.Password);
+
+            using (var conn = new MySqlConnection(connStr))
+            {
+                conn.Open();
+                using (var cmd = new MySqlCommand("SHOW DATABASES;", conn))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        string dbName = reader.GetString(0);
+
+                        // Skip system databases only — no env variable filter
+                        if (dbName == "information_schema" ||
+                            dbName == "performance_schema" ||
+                            dbName == "mysql" ||
+                            dbName == "sys")
+                            continue;
+
+                        databases.Add(dbName);
+                    }
+                }
+            }
+
+            return databases;
+        }
+
         public void SetDatabase(string databaseName)
         {
             if (string.IsNullOrWhiteSpace(databaseName))
@@ -263,7 +309,6 @@ namespace BACKUPANDRESTORETOOL.Controller
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
 
-            // ── Ensure D:\backup exists ──
             if (!Directory.Exists(BackupTempFolder))
                 Directory.CreateDirectory(BackupTempFolder);
 
@@ -280,14 +325,12 @@ namespace BACKUPANDRESTORETOOL.Controller
                 LogProgress(progressLog, string.Format("Temp SQL file  : {0}", tempSql));
                 LogProgress(progressLog, "========================================");
 
-                // ── Step 1: Dump ──
                 LogProgress(progressLog, string.Format("[1/2] Dumping database '{0}' to temp file...", databaseName));
                 DumpDatabase(tempSql, BackupTempFolder);
 
                 var sqlInfo = new FileInfo(tempSql);
                 LogProgress(progressLog, string.Format("      Dump complete. File size: {0:N0} bytes", sqlInfo.Length));
 
-                // ── Step 2: Compress directly to final destination (no .tmp.7z) ──
                 LogProgress(progressLog, string.Format("[2/2] Compressing temp file to: {0}", destinationZipPath));
 
                 if (File.Exists(destinationZipPath))
@@ -309,7 +352,6 @@ namespace BACKUPANDRESTORETOOL.Controller
             }
             finally
             {
-                // ── Clean up temp SQL — progress log stays so user can review it ──
                 try { if (File.Exists(tempSql)) File.Delete(tempSql); } catch { }
             }
         }
@@ -333,7 +375,6 @@ namespace BACKUPANDRESTORETOOL.Controller
             if (!destinationZipPath.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
                 destinationZipPath = destinationZipPath + ".7z";
 
-            // ── Ensure D:\backup exists ──
             if (!Directory.Exists(BackupTempFolder))
                 Directory.CreateDirectory(BackupTempFolder);
 
@@ -356,7 +397,6 @@ namespace BACKUPANDRESTORETOOL.Controller
                     LogProgress(progressLog, string.Format("Branch         : {0}", branch));
                 LogProgress(progressLog, "========================================");
 
-                // ── Step 1: Dump each database ──
                 for (int i = 0; i < databaseNames.Count; i++)
                 {
                     string dbName = databaseNames[i];
@@ -393,7 +433,6 @@ namespace BACKUPANDRESTORETOOL.Controller
                     tempSqlFiles.Add(tempSql);
                 }
 
-                // ── Step 2: Compress all SQL files directly into the final zip (no .tmp.7z) ──
                 LogProgress(progressLog, string.Format(
                     "[{0}/{0}] Compressing {1} file(s) into: {2}",
                     databaseNames.Count + 1, tempSqlFiles.Count, destinationZipPath));
@@ -418,7 +457,6 @@ namespace BACKUPANDRESTORETOOL.Controller
             }
             finally
             {
-                // ── Clean up temp SQL files — progress log stays for review ──
                 foreach (var f in tempSqlFiles)
                 {
                     try { if (File.Exists(f)) File.Delete(f); } catch { }
@@ -446,35 +484,41 @@ namespace BACKUPANDRESTORETOOL.Controller
 
             _config.Database = targetDatabase;
 
-            string tempFolder = @"D:\backup\restore\" + Guid.NewGuid().ToString("N");
+            string tempFolder = @"D:\backup\restore";
             Directory.CreateDirectory(tempFolder);
 
             string sqlFile;
 
-            if (sourceZipPath.EndsWith(".sql", StringComparison.OrdinalIgnoreCase))
+            try
             {
-                sqlFile = sourceZipPath;
-            }
-            else
-            {
-                ExtractWithSevenZip(sourceZipPath, tempFolder, plainPassword);
+                if (sourceZipPath.EndsWith(".sql", StringComparison.OrdinalIgnoreCase))
+                {
+                    sqlFile = sourceZipPath;
+                }
+                else
+                {
+                    ExtractWithSevenZip(sourceZipPath, tempFolder, plainPassword);
 
-                var sqlFiles = Directory.GetFiles(tempFolder, "*.sql", SearchOption.AllDirectories);
-                if (sqlFiles.Length == 0)
-                    throw new FileNotFoundException("No .sql file found inside the backup archive.");
+                    var sqlFiles = Directory.GetFiles(tempFolder, "*.sql", SearchOption.AllDirectories);
+                    if (sqlFiles.Length == 0)
+                        throw new FileNotFoundException("No .sql file found inside the backup archive.");
 
-                sqlFile = sqlFiles[0];
-            }
+                    sqlFile = sqlFiles[0];
+                }
 
-            RestoreDatabase(sqlFile, sourceZipPath);
-
-            try { Directory.Delete(tempFolder, true); } catch { 
+                RestoreDatabase(sqlFile, sourceZipPath, null);
             }
             finally
-{
-        // Always clean up temp folder, success or failure
-             try { Directory.Delete(tempFolder, true); } catch { }
-}
+            {
+                try
+                {
+                    foreach (var f in Directory.GetFiles(tempFolder, "*.sql"))
+                        File.Delete(f);
+                    foreach (var f in Directory.GetFiles(tempFolder, "*.clean.sql"))
+                        File.Delete(f);
+                }
+                catch { }
+            }
         }
 
         // ── RESTORE SPECIFIC DATABASE FROM ZIP ──
@@ -497,22 +541,78 @@ namespace BACKUPANDRESTORETOOL.Controller
 
             _config.Database = targetDatabase;
 
-            string tempFolder = @"D:\backup\restore\" + Guid.NewGuid().ToString("N");
+            string tempFolder = @"D:\backup\restore";
+            Directory.CreateDirectory(tempFolder);
+            string args = string.Format(
+            "e \"{0}\" -o\"{1}\" \"-p{2}\"",
+            sourceZipPath, tempFolder, plainPassword);
+            // Tanggal na ang -y
+
+            try
+            {
+                RunProcessWithLog(_sevenZipCliExe, args + " -y", "7-Zip extraction failed", sourceZipPath, "7-zip extract");
+
+                string sqlFile = null;
+
+                string exactMatch = Path.Combine(tempFolder, sqlFileName + ".sql");
+                if (File.Exists(exactMatch))
+                {
+                    sqlFile = exactMatch;
+                }
+                else
+                {
+                    var matched = Directory.GetFiles(tempFolder, sqlFileName + "*.sql");
+                    if (matched.Length > 0)
+                        sqlFile = matched[0];
+                }
+
+                if (sqlFile == null)
+                    throw new FileNotFoundException(
+                        string.Format("Could not find {0}.sql in the archive.", sqlFileName));
+
+                RestoreDatabase(sqlFile, sourceZipPath, null);
+            }
+            finally
+            {
+                try
+                {
+                    foreach (var f in Directory.GetFiles(tempFolder, "*.sql"))
+                        File.Delete(f);
+                    foreach (var f in Directory.GetFiles(tempFolder, "*.clean.sql"))
+                        File.Delete(f);
+                }
+                catch { }
+            }
+        }
+        // ── EXTRACT ONLY — silent ──
+        public void ExtractOnly(string sourceZipPath, string sqlFileName)
+        {
+            string encryptedPassword = ConfigurationManager.AppSettings["EncrpytedPassword"];
+            if (string.IsNullOrWhiteSpace(encryptedPassword))
+                throw new Exception("No encrypted password found in App.config.");
+
+            string plainPassword = _crypto.Decrypt(encryptedPassword, "pullasciiencrypt");
+
+            string tempFolder = @"D:\backup\restore";
             Directory.CreateDirectory(tempFolder);
 
             string args = string.Format(
                 "e \"{0}\" -o\"{1}\" \"-p{2}\" -y",
                 sourceZipPath, tempFolder, plainPassword);
 
-            RunProcessGui(_sevenZipGuiExe, args, "7-Zip extraction failed", sourceZipPath);
+            RunProcessWithLog(_sevenZipCliExe, args, "7-Zip extraction failed", sourceZipPath, "7-zip extract");
+        }
+
+        // ── RESTORE ONLY — mysql ──
+        public void RestoreOnly(string sourceZipPath, string targetDatabase, string sqlFileName, IProgress<int> progress = null)
+        {
+            _config.Database = targetDatabase;
+            string tempFolder = @"D:\backup\restore";
 
             string sqlFile = null;
-
             string exactMatch = Path.Combine(tempFolder, sqlFileName + ".sql");
             if (File.Exists(exactMatch))
-            {
                 sqlFile = exactMatch;
-            }
             else
             {
                 var matched = Directory.GetFiles(tempFolder, sqlFileName + "*.sql");
@@ -524,16 +624,22 @@ namespace BACKUPANDRESTORETOOL.Controller
                 throw new FileNotFoundException(
                     string.Format("Could not find {0}.sql in the archive.", sqlFileName));
 
-            RestoreDatabase(sqlFile, sourceZipPath);
-
-            try { Directory.Delete(tempFolder, true); } catch { 
+            try
+            {
+                RestoreDatabase(sqlFile, sourceZipPath, progress);
             }
             finally
             {
-                try { Directory.Delete(tempFolder, true); } catch { }
+                try
+                {
+                    foreach (var f in Directory.GetFiles(tempFolder, "*.sql"))
+                        File.Delete(f);
+                    foreach (var f in Directory.GetFiles(tempFolder, "*.clean.sql"))
+                        File.Delete(f);
+                }
+                catch { }
             }
         }
-
         // ════════════════════════════════════════════
         // ── PRIVATE HELPERS ──
         // ════════════════════════════════════════════
@@ -545,10 +651,10 @@ namespace BACKUPANDRESTORETOOL.Controller
                 Directory.CreateDirectory(sqlDir);
 
             string args = string.Format(
-                "--host={0} --port={1} --user={2} --password={3} " +
-                "--single-transaction --routines --triggers -v \"{4}\"",
-                _config.Server, _config.Port, _config.UserId,
-                _config.Password, _config.Database);
+            "--host={0} --port={1} --user={2} --password={3} " +
+            "--single-transaction --routines --triggers --events -v \"{4}\"",
+             _config.Server, _config.Port, _config.UserId,
+            _config.Password, _config.Database);
 
             var psi = new ProcessStartInfo
             {
@@ -567,11 +673,9 @@ namespace BACKUPANDRESTORETOOL.Controller
             {
                 process.Start();
 
-                // ── Read stderr on a separate thread to prevent deadlock ──
                 var stderrTask = System.Threading.Tasks.Task.Run(
                     () => process.StandardError.ReadToEnd());
 
-                // ── Read stdout (the actual SQL dump) directly to file ──
                 using (var fs = new FileStream(outputSqlPath, FileMode.Create, FileAccess.Write))
                 {
                     process.StandardOutput.BaseStream.CopyTo(fs);
@@ -589,23 +693,8 @@ namespace BACKUPANDRESTORETOOL.Controller
                     "mysqldump failed (exit {0}):\n{1}", exitCode, stderr));
         }
 
-        // ════════════════════════════════════════════════════════════
-        // ── RESTORE DATABASE
-        //
-        //    Handles big data (10 GB+) by:
-        //      1. Stripping USE statements from the SQL file
-        //      2. Running mysql.exe via ProcessStartInfo with stdin
-        //         stream fed from FileStream in a background thread
-        //         — avoids pipe deadlock and buffer limits
-        //      3. Key large-file flags:
-        //           --max_allowed_packet=512M  → big INSERT rows
-        //           --net_read_timeout=3600    → 1 hr read timeout
-        //           --connect_timeout=3600     → 1 hr connect timeout
-        //           --init-command             → sets session packet size
-        // ════════════════════════════════════════════════════════════
-        private void RestoreDatabase(string sqlFilePath, string logRef)
+        private void RestoreDatabase(string sqlFilePath, string logRef, IProgress<int> progress = null)
         {
-            // ── Ensure the target database exists ──
             string connStr = string.Format(
                 "Server={0};Port={1};Uid={2};Password={3};",
                 _config.Server, _config.Port, _config.UserId, _config.Password);
@@ -614,7 +703,6 @@ namespace BACKUPANDRESTORETOOL.Controller
             {
                 conn.Open();
 
-                // Increase packet size for large restores
                 using (var cmd = new MySqlCommand("SET GLOBAL max_allowed_packet=536870912;", conn))
                 {
                     try { cmd.ExecuteNonQuery(); } catch { /* ignore if no SUPER privilege */ }
@@ -625,7 +713,6 @@ namespace BACKUPANDRESTORETOOL.Controller
                     cmd.ExecuteNonQuery();
             }
 
-            // ── Strip USE statements into a clean SQL file ──
             string cleanSqlPath = sqlFilePath + ".clean.sql";
             using (var reader = new StreamReader(sqlFilePath, Encoding.UTF8))
             using (var writer = new StreamWriter(cleanSqlPath, false, Encoding.UTF8))
@@ -639,7 +726,6 @@ namespace BACKUPANDRESTORETOOL.Controller
                 }
             }
 
-            // ── Build mysql.exe arguments with all large-file flags ──
             string args = string.Format(
              "--host={0} --port={1} --user={2} --password={3}" +
              " --max_allowed_packet=512M" +
@@ -649,7 +735,7 @@ namespace BACKUPANDRESTORETOOL.Controller
                 _config.Port,
                 _config.UserId,
                 _config.Password,
-                 _config.Database);
+                _config.Database);
 
             var psi = new ProcessStartInfo
             {
@@ -668,35 +754,45 @@ namespace BACKUPANDRESTORETOOL.Controller
             {
                 process.Start();
 
-                // ── Read stderr asynchronously to prevent pipe deadlock ──
                 var stderrTask = System.Threading.Tasks.Task.Run(
                     () => process.StandardError.ReadToEnd());
 
-                // ── Feed the SQL file into stdin on a background thread
-                //    using a large 4 MB buffer — avoids blocking the main
-                //    thread and handles files of any size safely ──
                 var stdinTask = System.Threading.Tasks.Task.Run(() =>
                 {
                     try
                     {
+                        long totalBytes = new FileInfo(cleanSqlPath).Length;
+                        long bytesWritten = 0;
+                        byte[] buffer = new byte[4 * 1024 * 1024]; // 4MB chunks
+                        int bytesRead;
+
                         using (var fs = new FileStream(
                             cleanSqlPath,
                             FileMode.Open,
                             FileAccess.Read,
                             FileShare.Read,
-                            bufferSize: 4 * 1024 * 1024))   // 4 MB buffer
+                            bufferSize: 4 * 1024 * 1024))
                         {
-                            fs.CopyTo(process.StandardInput.BaseStream);
+                            while ((bytesRead = fs.Read(buffer, 0, buffer.Length)) > 0)
+                            {
+                                process.StandardInput.BaseStream.Write(buffer, 0, bytesRead);
+                                bytesWritten += bytesRead;
+
+                                if (progress != null && totalBytes > 0)
+                                {
+                                    int percent = (int)((bytesWritten * 100L) / totalBytes);
+                                    progress.Report(percent);
+                                }
+                            }
                         }
                     }
-                    catch { /* process may have exited on error — ignore */ }
+                    catch { }
                     finally
                     {
                         try { process.StandardInput.Close(); } catch { }
                     }
                 });
 
-                // ── Wait for stdin feed to finish, then collect stderr ──
                 stdinTask.Wait();
                 stderr = stderrTask.Result;
                 process.WaitForExit();
@@ -705,7 +801,6 @@ namespace BACKUPANDRESTORETOOL.Controller
 
             WriteLog(logRef, "mysql restore", _mysqlExe, exitCode, stderr);
 
-            // ── Clean up temp file ──
             try { if (File.Exists(cleanSqlPath)) File.Delete(cleanSqlPath); } catch { }
 
             if (exitCode != 0)
@@ -741,10 +836,10 @@ namespace BACKUPANDRESTORETOOL.Controller
                 "e \"{0}\" -o\"{1}\" \"-p{2}\" -y",
                 sourceZip, destFolder, password);
 
-            RunProcessGui(_sevenZipGuiExe, args, "7-Zip extraction failed", sourceZip);
+            RunProcessWithLog(_sevenZipCliExe, args, "7-Zip extraction failed", sourceZip, "7-zip extract");
         }
 
-        // ── Main log writer (verbose/error log per backup job) ──
+        // ── Main log writer ──
         private static void WriteLog(string zipPath, string section, string exe,
                                      int exitCode, string stderr)
         {
@@ -780,7 +875,7 @@ namespace BACKUPANDRESTORETOOL.Controller
             catch { /* never let logging crash the backup */ }
         }
 
-        // ── Silent runner for mysqldump / mysql ──
+        // ── Silent runner for mysqldump / mysql / 7z CLI ──
         private static void RunProcessWithLog(string exe, string args, string errorMsg,
                                               string logRef, string section)
         {
@@ -823,7 +918,7 @@ namespace BACKUPANDRESTORETOOL.Controller
                     errorMsg, exitCode, stdout, stderr));
         }
 
-        // ── GUI runner for 7zg.exe / 7z.exe ──
+        // ── GUI runner for 7zg.exe — backup/compression only ──
         private static void RunProcessGui(string exe, string args, string errorMsg, string logRef)
         {
             var psi = new ProcessStartInfo
